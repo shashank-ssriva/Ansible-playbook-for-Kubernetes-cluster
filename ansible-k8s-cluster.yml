@@ -1,0 +1,103 @@
+---
+- hosts: all
+  become: true
+  tasks:
+  - name: Install dependencies for Docker
+    yum:
+      name: yum-utils
+      state: present
+
+  - name: Add Docker repository
+    command: yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+  - name: Install Docker
+    yum: 
+      name: "{{ packages }}"
+      state: present
+    vars:
+      packages:
+      - docker-ce
+      - docker-ce-cli 
+      - containerd.io
+    
+  - name: Start & enable Docker service
+    ansible.builtin.service:
+      name: docker
+      state: started
+      enabled: yes
+
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+
+  - name: Disable IPtables
+    command: iptables -F
+
+  - name: Disable SELinux
+    command: setenforce 0
+
+  - name: Add YUM repository for Kubernetes
+    ansible.builtin.copy:
+      src: kubernetes.repo
+      dest: /etc/yum.repos.d/kubernetes.repo
+
+  - name: Install Kubernetes
+    yum: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        - kubelet 
+        - kubeadm 
+        - kubectl
+
+  - name: Restart kubelet
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+
+  - name: Initialize the Kubernetes cluster using kubeadm command
+    when: inventory_hostname in groups['k8s-master']
+    command: kubeadm init --apiserver-advertise-address="10.128.0.29" --pod-network-cidr=10.244.0.0/16
+
+  - name: Set up Kubernetes for shashank user
+    command: "{{ item }}"
+    when: inventory_hostname in groups['k8s-master']
+    with_items:
+    - mkdir -p /home/shashank/.kube
+    - cp -i /etc/kubernetes/admin.conf /home/shashank/.kube/config
+    - chown shashank:shashank /home/shashank/.kube/config
+
+  - name: Install Flannel pod network
+    become: false
+    when: inventory_hostname in groups['k8s-master']
+    command: kubectl apply -f https://github.com/coreos/flannel/raw/master/Documentation/kube-flannel.yml
+
+  - name: Retrieve Kubernetes join command that is used to join worker node(s)
+    become: false
+    when: inventory_hostname in groups['k8s-master']
+    command: kubeadm token create --print-join-command
+    register: join_command
+
+  - name: Attach kubeadm join command to a file on Ansible control node
+    when: inventory_hostname in groups['k8s-master']
+    local_action: "copy content='{{ join_command.stdout_lines[0] }}' dest=join-command"
+
+  - name: Copy the join-command file created above to worker node
+    when: inventory_hostname in groups['k8s-worker']
+    copy: src=join-command dest=/tmp/kubeadm-join.sh mode=0777
+
+  - name: Join the worker node to cluster
+    when: inventory_hostname in groups['k8s-worker']
+    command: sh /tmp/kubeadm-join.sh
